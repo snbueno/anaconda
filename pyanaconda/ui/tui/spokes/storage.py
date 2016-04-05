@@ -86,8 +86,8 @@ class StorageSpoke(NormalTUISpoke):
 
         # automatically dasdfmt any unformatted/ldl dasds if a user has
         # specified zerombr/cdl in their ks file
-        if arch.isS390() and (self.data.zerombr.zerombr or self.data.clearpart.cdl):
-            self.run_dasdfmt(self.selected_disks)
+        if arch.isS390() and flags.automatedInstall:
+            self.run_dasdfmt()
 
         if not flags.automatedInstall:
             # default to using autopart for interactive installs
@@ -272,14 +272,8 @@ class StorageSpoke(NormalTUISpoke):
                     # LDL DASDs if we're on s390x, since they need to be
                     # formatted before we can use them.
                     if arch.isS390():
-                        dasds = make_unformatted_dasd_list(self.selected_disks)
-                        if dasds:
-                            self.run_dasdfmt(dasds)
-                            return None
-                        ldldasds = [d.name for d in self.storage.devicetree.dasd if is_ldl_dasd(d.name)]
-                        if ldldasds:
-                            self.run_dasdfmt(ldldasds)
-                            return None
+                        self.run_dasdfmt()
+                        return None
 
                     # make sure no containers were split up by the user's disk
                     # selection
@@ -300,7 +294,7 @@ class StorageSpoke(NormalTUISpoke):
             else:
                 return key
 
-    def run_dasdfmt(self, to_format):
+    def run_dasdfmt(self):
         """
         This generates the list of DASDs requiring dasdfmt and runs dasdfmt
         against them.
@@ -310,8 +304,35 @@ class StorageSpoke(NormalTUISpoke):
         # zerombr in their ks file
         threadMgr.wait(THREAD_STORAGE)
 
-        # ask user to verify they want to format if zerombr or cdl not in ks file
-        if not (self.data.zerombr.zerombr or self.data.clearpart.cdl):
+        # handle ks case first since it's a bit simpler
+        if flags.automatedInstall:
+            dasds = []
+            if self.data.zerombr.zerombr:
+                # unformatted DASDs
+                dasds += make_unformatted_dasd_list([d.name for d in self.storage.devicetree.dasd])
+            if self.data.clearpart.cdl:
+                # LDL formatted DASDs
+                dasds += [d for d in self.data.ignoredisk.onlyuse if is_ldl_dasd(d)]
+
+            for disk in dasds:
+                try:
+                    format_dasd(disk)
+                except DasdFormatError as err:
+                    # Log errors if formatting fails, but don't halt the installer
+                    log.error(str(err))
+                    continue
+        else:
+            # now for case of manual installation
+            # grab all unformatted DASDs first
+            unformatted = make_unformatted_dasd_list(self.selected_disks)
+
+            # now add on LDL DASDs
+            ldl = [d for d in self.selected_disks if is_ldl_dasd(d)]
+
+            # combine all into a list; use set() to throw out any potential duplicates,
+            # since....that can happen, and it's a waste of time to format a disk twice
+            dasds = list(set(unformatted + ldl))
+
             # prepare our msg strings; copied directly from dasdfmt.glade
             summary = _("The following unformatted or LDL DASDs have been "
                         "detected on your system. You can choose to format them "
@@ -320,7 +341,7 @@ class StorageSpoke(NormalTUISpoke):
 
             warntext = _("Warning: All storage changes made using the installer will be lost when you choose to format.\n\nProceed to run dasdfmt?\n")
 
-            displaytext = summary + "\n".join("/dev/" + d for d in to_format) + "\n" + warntext
+            displaytext = summary + "\n".join("/dev/" + d for d in dasds) + "\n" + warntext
 
             # now show actual prompt; note -- in cmdline mode, auto-answer for
             # this is 'no', so unformatted and ldl DASDs will remain so unless
@@ -331,14 +352,14 @@ class StorageSpoke(NormalTUISpoke):
                 # no? well fine then, back to the storage spoke with you;
                 return None
 
-        for disk in to_format:
-            try:
-                print(_("Formatting /dev/%s. This may take a moment.") % disk)
-                format_dasd(disk)
-            except DasdFormatError as err:
-                # Log errors if formatting fails, but don't halt the installer
-                log.error(str(err))
-                continue
+            for disk in dasds:
+                try:
+                    print(_("Formatting /dev/%s. This may take a moment.") % disk)
+                    format_dasd(disk)
+                except DasdFormatError as err:
+                    # Log errors if formatting fails, but don't halt the installer
+                    log.error(str(err))
+                    continue
 
         # need to make devicetree aware of disk changes
         threadMgr.add(AnacondaThread(name=THREAD_STORAGE, target=storageInitialize,
